@@ -15,14 +15,17 @@
       "supportsTablet": true
     },
     "android": {
+      "permissions": [
+        "ACCESS_FINE_LOCATION", 
+        "CAMERA",
+        "WRITE_EXTERNAL_STORAGE",
+        "ACCESS_BACKGROUND_LOCATION"
+      ],
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/Skool-Logo.png",
         "backgroundColor": "#ffffff"
       },
-      "notification": {
-        "icon": "./assets/Skool-Logo.png", 
-        "color": "#ffffff" 
-      }
+      "package": "com.joshua22.skool"
     },
     "web": {
       "favicon": "./assets/favicon.png"
