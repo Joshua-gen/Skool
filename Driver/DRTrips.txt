@@ -1,0 +1,435 @@
+import React, { useState, useEffect } from 'react';
+import { GOOGLE_MAPS_KEY } from '@env';
+import { StyleSheet, View, Text, FlatList, ActivityIndicator, TouchableOpacity, Image, RefreshControl, Alert} from 'react-native';
+import { styles } from './src/style'
+import { firestore, auth } from '../Config'; 
+import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
+import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import FontAwesome6 from '@expo/vector-icons/FontAwesome6';
+import Entypo from '@expo/vector-icons/Entypo';
+
+
+const DRTrips = ({ navigation }) => {
+  const [userRides, setUserRides] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false); // State for refreshing
+  const [dropOffs, setDropOffs] = useState({}); // Maintain dropOffs state
+
+  const fetchUserRides = async () => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      console.error('User not logged in!');
+      return;
+    }
+
+    try {
+      const ridesSnapshot = await firestore
+        .collection('Ride')
+        .where('driverId', '==', currentUser.uid)
+        .where('isFinish', '==', false)
+        .get();
+
+      const ridesData = ridesSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+
+      setUserRides(ridesData);
+    } catch (error) {
+      console.error('Error fetching rides:', error);
+    } finally {
+      setLoading(false);
+      setRefreshing(false); // Stop the refreshing animation after data is loaded
+    }
+  };
+
+  // start ride will add the time of starting the ride 
+  const startRide = async (rideId) => {
+    try {
+      // Fetch the existing ride data
+      const rideDoc = await firestore.collection('Ride').doc(rideId).get();
+      const rideData = rideDoc.data();
+      const rideOriginCoords = rideData.rideOrigin; // Ride origin coordinates
+      const rideDestinationCoords = rideData.rideDestination; // Ride destination coordinates
+      
+      let updatedSeats = { ...rideData.seats };  // Get all seats
+      let totalFare = 0;  // Initialize total fare
+  
+      // Calculate the default fare for the ride
+      const defaultDistance = haversineDistance(rideOriginCoords, rideDestinationCoords);
+      const defaultFare = calculateFare(rideOriginCoords, rideDestinationCoords);
+  
+      // Update each seat's drop-off and fare only for occupied seats
+      Object.keys(updatedSeats).forEach((seatKey) => {
+        const seat = updatedSeats[seatKey];
+        if (seat && seat.passengerId) {  // Only calculate fare for occupied seats
+          // Set default drop-off and fare if not already set
+          if (!seat.dropOff) {
+            updatedSeats[seatKey].dropOff = {
+              place: rideData.rideDestinationPlace,
+              latitude: rideDestinationCoords.latitude,
+              longitude: rideDestinationCoords.longitude,
+              distance: defaultDistance,
+              fare: defaultFare
+            };
+          }
+          totalFare += updatedSeats[seatKey].dropOff.fare;  // Add fare to total
+        }
+      });
+  
+      // Save updated seat information and start time
+      await firestore.collection('Ride').doc(rideId).update({
+        startTime: new Date(),  // Record start time
+        seats: updatedSeats,    // Save updated seats with default drop-offs
+        totalFare: totalFare    // Update total fare only for occupied seats
+      });
+  
+      Alert.alert('Success', 'Ride started successfully with default drop-offs for occupied seats!');
+      fetchUserRides();  // Re-fetch the data to update the UI
+    } catch (error) {
+      console.error('Error starting ride:', error);
+      Alert.alert('Error', 'Failed to start the ride.');
+    }
+  };
+  
+
+
+  //finish ride it will chnage the value of ride isFinish into true
+  const finishRide = async (rideId) => {
+    try {
+      await firestore.collection('Ride').doc(rideId).update({
+        isFinish: true,  // Mark the ride as finished
+      });
+  
+      Alert.alert('Congrats', 'Your trip has been finished!');
+      
+      fetchUserRides();  // Re-fetch the data to update the UI
+    } catch (error) {
+      console.error('Error finishing ride:', error);
+      Alert.alert('Error', 'Failed to finish the ride.');
+    }
+  };
+  
+  // setting Dropoff 
+  const handleDropoffSelect = (rideId, seatKey, location) => {
+    console.log('Ride ID:', rideId);
+    console.log('Seat Key:', seatKey);
+    console.log('Location:', location);
+  
+    // Check if location and rideId are provided
+    if (location && rideId) {
+      // Fetch the ride document from Firestore
+      firestore.collection('Ride').doc(rideId).get()
+        .then((doc) => {
+          if (doc.exists) {
+            const rideData = doc.data(); // Get ride data
+            const rideOriginCoords = rideData.rideOrigin; // Ride origin coordinates
+            const dropOffCoords = location.coordinates; // Coordinates of selected drop-off location
+            
+            // Default drop-off coordinates if no drop-off is set for a seat
+            const defaultDropOff = {
+              latitude: rideData.rideDestination.latitude,
+              longitude: rideData.rideDestination.longitude
+            };
+  
+            // Ensure ride origin and drop-off coordinates are available
+            if (rideOriginCoords && dropOffCoords) {
+              // Calculate distance between ride origin and selected drop-off
+              const distance = haversineDistance(rideOriginCoords, dropOffCoords);
+              // Calculate fare based on the distance
+              const fare = calculateFare(rideOriginCoords, dropOffCoords);
+  
+              // Update the Firestore document with drop-off details for the seat
+              return firestore.collection('Ride').doc(rideId).update({
+                [`seats.${seatKey}.dropOff`]: {
+                  place: location.place,
+                  latitude: dropOffCoords.latitude,
+                  longitude: dropOffCoords.longitude,
+                  distance: distance,
+                  fare: fare
+                }
+              }).then(() => {
+                // Fetch the ride data again after updating drop-off
+                return firestore.collection('Ride').doc(rideId).get();
+              }).then((doc) => {
+                if (doc.exists) {
+                  const rideData = doc.data();
+                  const seats = rideData.seats; // Get the seats object
+                  let totalFare = 0; // Initialize total fare
+  
+                  // Iterate over all seats to calculate total fare
+                  Object.keys(seats).forEach((key) => {
+                    const seat = seats[key];
+                    const seatDropOff = seat.dropOff;
+  
+                    if (seat && seatDropOff) {
+                      // Add fare of seat with drop-off set
+                      totalFare += seatDropOff.fare;
+                    } else if (seat && !seatDropOff) {
+                      // If no drop-off, use the default ride destination
+                      const defaultDistance = haversineDistance(rideOriginCoords, defaultDropOff);
+                      const defaultFare = calculateFare(rideOriginCoords, defaultDropOff);
+                      totalFare += defaultFare;
+                    }
+                  });
+  
+                  // Update total fare in Firestore document
+                  return firestore.collection('Ride').doc(rideId).update({
+                    totalFare: totalFare
+                  });
+                }
+              });
+            } else {
+              throw new Error('Missing coordinates'); // Error if coordinates are missing
+            }
+          } else {
+            throw new Error('Ride not found'); // Error if ride document doesn't exist
+          }
+        })
+        .then(() => {
+          // Success message after updating drop-off and total fare
+          Alert.alert('Success', 'Drop-off updated and total fare recalculated!');
+          fetchUserRides(); // Refresh the ride data on UI
+        })
+        .catch((error) => {
+          // Handle errors during Firestore operations
+          console.error('Error updating drop-off:', error);
+          Alert.alert('Error', 'Failed to update drop-off.');
+        });
+    } else {
+      // Alert if rideId or location data is invalid
+      Alert.alert('Error', 'Invalid ride ID or location data.');
+    }
+  };
+  
+  
+  
+  // fare matrix function
+  function haversineDistance(coords1, coords2) {
+    const toRad = (value) => (value * Math.PI) / 180;  // Convert degrees to radians
+    const R = 6371; // Earth's radius in kilometers
+  
+    const dLat = toRad(coords2.latitude - coords1.latitude);
+    const dLon = toRad(coords2.longitude - coords1.longitude);
+    
+    const lat1 = toRad(coords1.latitude);
+    const lat2 = toRad(coords2.latitude);
+  
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(lat1) * Math.cos(lat2) *
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  
+    const distance = R * c; // Distance in kilometers
+    return distance;
+  }
+  // fare matrix function
+  const calculateFare = (rideOrigin, dropOff) => {
+  const distance = haversineDistance(rideOrigin, dropOff);
+  const fare = distance * 2; // 2 pesos per kilometer
+  return fare;
+};
+
+ 
+  useEffect(() => {
+    fetchUserRides();
+  }, []);
+
+  const onRefresh = () => {
+    setRefreshing(true);
+    fetchUserRides(); // Fetch new data on refresh
+  };
+
+
+  // function to render seats
+  const renderSeats = (Seats, vehicleClass, rideId) => {    
+    return (
+      <View>
+        {Object.keys(Seats)
+          .sort((a, b) => Number(a) - Number(b))  // Sort seat keys numerically
+          .map((seatKey) => {
+            const seatData = Seats[seatKey]; // Assuming seatData contains passengerId, firstName, lastName
+
+            return (
+              <View key={seatKey} style={styles.seatContainer}>
+                <View style={styles.seatVal}>
+                  <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                    <MaterialIcons name="airline-seat-recline-normal" size={24} color="black" />
+                    <Text style={styles.seatText}>
+                      {seatKey}
+                    </Text>
+                  </View>
+                  <Text style={[
+                    styles.seatStatusText,
+                    seatData ? styles.occupiedText : styles.availableText // Conditional styling
+                  ]}>
+                    
+                    {seatData ? 'Occupied' : 'Available'}
+                  </Text>
+                </View>
+                {seatData && (
+                  <View style={styles.seatVal2}>
+                    <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                      <Text style={styles.pssLabel}>Name: </Text>
+                      <Text style={styles.pssValue}>
+                        {seatData.firstName} {seatData.lastName}
+                      </Text>
+                    </View>
+                    <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                      <Text style={styles.pssLabel}>ID: </Text>
+                      <Text style={styles.pssValue}>
+                       {seatData.passengerId}
+                      </Text>
+                    </View>
+                    {vehicleClass !== 'Motorcycle' && (
+                      <View>
+                        <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                          <Text style={styles.pssLabel}>Drop off: </Text>
+                          <Text style={styles.pssValue}>
+                            {seatData.dropOff?.place || 'Not set'}
+                          </Text>
+                        </View>
+                        <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                          <Text style={styles.pssLabel}>Distance: </Text>
+                          <Text style={styles.pssValue}>
+                            {seatData.dropOff?.distance.toFixed(2) || 'Not set'} km
+                          </Text>
+                        </View>
+                        <View style={{flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-end'}}>
+                          <Text style={styles.pssLabel}>Fare:   </Text>
+                          <FontAwesome6 name="peso-sign" size={20} color="black"/>
+                          <Text style={[styles.pssValue, {fontSize: 20}]}>
+                              {seatData.dropOff?.fare.toFixed(2) || 'Not set'}</Text>
+                        </View>
+                      </View>
+                    )}
+                  </View>
+                )}
+                {/* Declare Drop off of each passenger */}
+                {vehicleClass !== 'Motorcycle' && seatData && !seatData.dropOff && (
+                  <TouchableOpacity
+                    style={[styles.button, styles.dropoff]}
+                    onPress={() => {
+                      navigation.navigate('Dropoff', {
+                        onPlaceSelect: (location) => handleDropoffSelect(rideId, seatKey, location),
+                      });
+                    }}
+                  >
+                    <Text>Set drop off</Text>
+                  </TouchableOpacity>
+                )}
+
+              </View>
+            );
+          })}
+      </View>
+    );
+  };
+
+  if (loading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Image
+          style={{ width: 100, height: 100, marginBottom: 10 }}
+          source={require('../assets/Skool-Logo.png')}
+        />
+        <ActivityIndicator size="large" color="white" />
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <FlatList
+        style={{ marginTop: 30 }}
+        data={userRides}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => (
+          <View style={styles.rideItem}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+              <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 18 }}>Your Current Trip</Text>
+              <Text style={styles.rideText}>
+                {item?.isFinish ? 'Completed' : 'Ongoing'}
+              </Text>
+            </View>
+
+            <View style={{ marginBottom: 10 }}>
+              <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                <Entypo name="location-pin" size={25} color="black" />
+                <Text style={styles.label}>Origin:</Text>
+              </View>
+              <View style={{ marginLeft: 15 }}>
+                <Text style={styles.value}> {item?.rideOriginPlace}</Text>
+                <Text style={{ fontFamily: 'Poppins-Regular', color: 'grey' }}>
+                  {item?.rideOrigin?.latitude?.toFixed(6) || 'N/A'}, {item?.rideOrigin?.longitude?.toFixed(6) || 'N/A'}
+                </Text>
+              </View>
+            </View>
+
+            <View style={{ marginBottom: 10 }}>
+              <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                <Entypo name="location-pin" size={25} color="red" />
+                <Text style={styles.label}>Destination:</Text>
+              </View>
+              <View style={{ marginLeft: 15 }}>
+                <Text style={styles.value}> {item?.rideDestinationPlace}</Text>
+                <Text style={{ fontFamily: 'Poppins-Regular', color: 'grey' }}>
+                  {item?.rideDestination?.latitude?.toFixed(6) || 'N/A'}, {item?.rideDestination?.longitude?.toFixed(6) || 'N/A'}
+                </Text>
+              </View>
+            </View>
+
+            <View style={{ marginBottom: 10, flexDirection: 'row', justifyContent: 'space-between' }}> 
+              <View>
+                <Text style={styles.label}>Distance:</Text>
+                <View style={{ marginLeft: 15 }}>
+                  <Text style={styles.value}> {item?.distance?.toFixed(2)} km</Text>
+                </View>
+              </View>
+              <View>
+                <Text style={styles.label}>Total Fare:</Text>
+                <View style={{ marginLeft: 15, flexDirection: 'row', alignItems: 'center', }}>
+                  <FontAwesome6 name="peso-sign" size={20} color="black" />
+                  <Text style={[styles.value, {fontSize: 20}]}> {item?.totalFare?.toFixed(2)} </Text>
+                </View>
+              </View>
+            </View>
+            
+
+            <View style={{ marginBottom: 10, justifyContent: 'center' }}>
+              <Text style={styles.label}>Passenegr Seats:</Text>
+              {item?.seats ? renderSeats(item.seats, item.vehicleClass, item.id) : <View>No seat information available</View>}
+            </View>
+
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 20 }}>
+              {!item.startTime && (
+                <TouchableOpacity
+                  style={styles.button}
+                  onPress={() => startRide(item.id)}
+                >
+                  <Text>Start Ride</Text>
+                </TouchableOpacity>
+              )}
+
+              <TouchableOpacity 
+                style={styles.button} 
+                onPress={() => finishRide(item.id)}>
+                <Text>Finish Ride</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+      />
+    </View>
+  );
+};
+
+
+export default DRTrips;
+
+
